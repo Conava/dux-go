@@ -92,14 +92,14 @@ func TestHiddenLastGroupsAfterVisible(t *testing.T) {
 	sortEntries(entries, grouped)
 	assert.Equal(t, []string{"Music", ".cache", ".config", "a.txt", "b.txt", ".bashrc", "listed"}, namesOf(entries))
 
-	entries = insertSorted(entries, entry(".zshrc", false, true), grouped)
+	entries = mergeSorted(entries, []Entry{entry(".zshrc", false, true)}, grouped)
 	assert.Equal(t, []string{"Music", ".cache", ".config", "a.txt", "b.txt", ".bashrc", ".zshrc", "listed"}, namesOf(entries))
 
 	sortEntries(entries, SortSpec{Key: SortName, DirsFirst: true, HiddenLast: true, Desc: true})
 	assert.Equal(t, []string{"Music", ".config", ".cache", "b.txt", "a.txt", "listed", ".zshrc", ".bashrc"}, namesOf(entries))
 }
 
-func TestInsertSortedKeepsOrder(t *testing.T) {
+func TestMergeSortedKeepsOrder(t *testing.T) {
 	b := newBuilder(nil, nil)
 	entry := func(name string, isDir bool) Entry {
 		return Entry{Name: name, IsDir: isDir, nameKey: b.keys.key(name)}
@@ -107,7 +107,7 @@ func TestInsertSortedKeepsOrder(t *testing.T) {
 	spec := SortSpec{Key: SortName, DirsFirst: true}
 	entries := []Entry{entry("dir", true), entry("a.txt", false), entry("c.txt", false)}
 
-	entries = insertSorted(entries, entry("b.txt", false), spec)
-	entries = insertSorted(entries, entry("aaa", true), spec)
-	assert.Equal(t, []string{"aaa", "dir", "a.txt", "b.txt", "c.txt"}, namesOf(entries))
+	entries = mergeSorted(entries, []Entry{entry("d.txt", false), entry("b.txt", false), entry("aaa", true)}, spec)
+	assert.Equal(t, []string{"aaa", "dir", "a.txt", "b.txt", "c.txt", "d.txt"}, namesOf(entries))
+	assert.Equal(t, []string{"aaa", "dir"}, namesOf(mergeSorted(nil, []Entry{entry("dir", true), entry("aaa", true)}, spec)))
 }

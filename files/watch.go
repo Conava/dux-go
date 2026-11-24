@@ -21,6 +21,7 @@ const (
 	enrichChunk     = 64
 	thumbChunk      = 4
 	firstPageBudget = 40 * time.Millisecond
+	burstLimit      = 2 * DefaultPageSize
 )
 
 type notifier interface {
@@ -78,6 +79,8 @@ type watch struct {
 	seq           int
 	hidden        int
 	misplaced     bool
+	resumeAt      int
+	served        int
 	subscribed    bool
 	pending       []batch
 	dropped       bool
@@ -102,6 +105,7 @@ func (s *Service) openWatch(ctx context.Context, path string, opts ListOptions) 
 		watching:      notify != nil,
 		done:          make(chan struct{}),
 		entries:       entries,
+		served:        len(entries),
 		spec:          opts.Sort,
 		includeHidden: opts.IncludeHidden,
 		filters:       opts.Filters,
@@ -213,30 +217,39 @@ func (w *watch) flush(names []string) {
 	fresh := make([]Entry, 0, len(names))
 
 	w.mu.Lock()
-	before := namesOf(w.view())
-	touched := map[string]bool{}
+	burst := len(names) > burstLimit
+	var before []string
+	if !burst {
+		before = w.viewNames()
+	}
+	touched := make(map[string]bool, len(names))
 	for _, name := range names {
 		touched[name] = true
+	}
+	at := w.positions(touched)
+	leaving := make(map[int]bool, len(at))
+	for _, name := range names {
 		entry, err := w.svc.builder.entry(w.path, name, hidden[name])
-		index := w.indexOf(name)
+		index, known := at[name]
 		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			if index >= 0 {
-				w.entries = slices.Delete(w.entries, index, index+1)
-			}
+		case errors.Is(err, fs.ErrNotExist) && known:
+			leaving[index] = true
 		case err != nil:
 			continue
-		case index >= 0:
+		case known:
 			entry.Thumbnail = carryThumbnail(w.entries[index], entry)
-			w.entries[index] = entry
-			w.entries = w.resortAround(index)
+			leaving[index] = true
 			fresh = append(fresh, entry)
 		default:
-			w.entries = insertSorted(w.entries, entry, w.spec)
 			fresh = append(fresh, entry)
 		}
 	}
-	changes := w.diff(before, touched)
+	w.entries = mergeSorted(without(w.entries, leaving), fresh, w.spec)
+	changes := batch{Kind: "resync"}
+	if !burst {
+		changes = w.diff(before, touched)
+		w.served += len(changes.Added)
+	}
 	if hidden := hiddenCount(w.entries, w.includeHidden, w.filters); hidden != w.hidden {
 		w.hidden = hidden
 		changes.Hidden = &hidden
@@ -251,6 +264,72 @@ func (w *watch) view() []Entry {
 	return filterView(w.entries, w.includeHidden, w.filters)
 }
 
+func (w *watch) shows(e *Entry) bool {
+	if e.Hidden && !w.includeHidden {
+		return false
+	}
+	return len(w.filters) == 0 || w.filters.passes(*e)
+}
+
+func (w *watch) filteredOut() int {
+	out := 0
+	for i := range w.entries {
+		if !w.shows(&w.entries[i]) {
+			out++
+		}
+	}
+	return out
+}
+
+func (w *watch) viewNames() []string {
+	out := make([]string, 0, len(w.entries))
+	for i := range w.entries {
+		if w.shows(&w.entries[i]) {
+			out = append(out, w.entries[i].Name)
+		}
+	}
+	return out
+}
+
+func (w *watch) positions(names map[string]bool) map[string]int {
+	at := make(map[string]int, len(names))
+	count := len(w.entries)
+	if w.resumeAt >= count {
+		w.resumeAt = 0
+	}
+	start := w.resumeAt
+	for step := 0; step < count && len(at) < len(names); step++ {
+		i := (start + step) % count
+		if !names[w.entries[i].Name] {
+			continue
+		}
+		at[w.entries[i].Name] = i
+		w.resumeAt = i + 1
+	}
+	return at
+}
+
+func without(entries []Entry, leaving map[int]bool) []Entry {
+	first := len(entries)
+	for index, gone := range leaving {
+		if gone {
+			first = min(first, index)
+		}
+	}
+	if first == len(entries) {
+		return entries
+	}
+
+	kept := entries[:first]
+	for i := first; i < len(entries); i++ {
+		if !leaving[i] {
+			kept = append(kept, entries[i])
+		}
+	}
+	clear(entries[len(kept):])
+	return kept
+}
+
 func namesOf(entries []Entry) []string {
 	out := make([]string, len(entries))
 	for i, e := range entries {
@@ -261,10 +340,14 @@ func namesOf(entries []Entry) []string {
 
 // diff targets a client that removes by name first, then inserts at final indices in order.
 func (w *watch) diff(before []string, touched map[string]bool) batch {
-	view := w.view()
-	at := make(map[string]int, len(view))
-	for i, e := range view {
-		at[e.Name] = i
+	view := make([]*Entry, 0, len(w.entries))
+	at := make(map[string]int, len(w.entries))
+	for i := range w.entries {
+		if !w.shows(&w.entries[i]) {
+			continue
+		}
+		at[w.entries[i].Name] = len(view)
+		view = append(view, &w.entries[i])
 	}
 
 	changes := batch{Kind: "batch"}
@@ -284,25 +367,19 @@ func (w *watch) diff(before []string, touched map[string]bool) batch {
 	for index, entry := range view {
 		switch {
 		case !existed[entry.Name]:
-			changes.Added = append(changes.Added, entry)
+			changes.Added = append(changes.Added, *entry)
 			changes.AddedAt = append(changes.AddedAt, index)
 		case !touched[entry.Name]:
 			continue
 		case inOrder:
-			changes.Changed = append(changes.Changed, entry)
+			changes.Changed = append(changes.Changed, *entry)
 		default:
 			changes.Removed = append(changes.Removed, entry.Name)
-			changes.Added = append(changes.Added, entry)
+			changes.Added = append(changes.Added, *entry)
 			changes.AddedAt = append(changes.AddedAt, index)
 		}
 	}
 	return changes
-}
-
-func (w *watch) resortAround(index int) []Entry {
-	entry := w.entries[index]
-	rest := slices.Delete(slices.Clone(w.entries), index, index+1)
-	return insertSorted(rest, entry, w.spec)
 }
 
 func (w *watch) indexOf(name string) int {
@@ -403,10 +480,17 @@ func (w *watch) applyChanged(changed []Entry, kind string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	names := make(map[string]bool, len(changed))
+	for _, e := range changed {
+		names[e.Name] = true
+	}
+	at := w.positions(names)
+	unseen := w.served + w.filteredOut()
+
 	applied := make([]Entry, 0, len(changed))
 	for _, e := range changed {
-		index := w.indexOf(e.Name)
-		if index < 0 || w.entries[index].MtimeMs != e.MtimeMs {
+		index, known := at[e.Name]
+		if !known || w.entries[index].MtimeMs != e.MtimeMs {
 			continue
 		}
 		if kind == "thumbnails" {
@@ -417,7 +501,9 @@ func (w *watch) applyChanged(changed []Entry, kind string) {
 		e.nameKey = w.entries[index].nameKey
 		w.misplaced = w.misplaced || (w.spec.Key == SortType && w.entries[index].Mime != e.Mime)
 		w.entries[index] = e
-		applied = append(applied, e)
+		if index < unseen {
+			applied = append(applied, e)
+		}
 	}
 	applied = filterView(applied, w.includeHidden, w.filters)
 	if len(applied) == 0 {
@@ -522,7 +608,12 @@ func (w *watch) page(opts ListOptions) (Page, int) {
 	w.filters = opts.Filters
 	w.thumbSize = ParseThumbSize(opts.ThumbSize)
 	w.hidden = hiddenCount(w.entries, w.includeHidden, w.filters)
-	page := pageOf(w.view(), opts.Cursor, opts.Limit)
+	view := w.view()
+	page := pageOf(view, opts.Cursor, opts.Limit)
+	reach := resumeAt(view, opts.Cursor) + len(page.Entries)
+	if opts.Cursor == "" || reach > w.served {
+		w.served = reach
+	}
 	page.Entries = slices.Clone(page.Entries)
 	page.Hidden = w.hidden
 	return page, w.seq

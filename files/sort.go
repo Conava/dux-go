@@ -155,7 +155,23 @@ func compareName(a, b Entry) int {
 	return strings.Compare(a.Name, b.Name)
 }
 
-func insertSorted(entries []Entry, e Entry, spec SortSpec) []Entry {
-	index, _ := slices.BinarySearchFunc(entries, e, func(x, y Entry) int { return compareEntries(x, y, spec) })
-	return slices.Insert(entries, index, e)
+func mergeSorted(entries, incoming []Entry, spec SortSpec) []Entry {
+	if len(incoming) == 0 {
+		return entries
+	}
+	sortEntries(incoming, spec)
+
+	old := len(entries) - 1
+	entries = slices.Grow(entries, len(incoming))[:len(entries)+len(incoming)]
+	next := len(incoming) - 1
+	for slot := len(entries) - 1; next >= 0; slot-- {
+		if old >= 0 && compareEntries(entries[old], incoming[next], spec) > 0 {
+			entries[slot] = entries[old]
+			old--
+			continue
+		}
+		entries[slot] = incoming[next]
+		next--
+	}
+	return entries
 }

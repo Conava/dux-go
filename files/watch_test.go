@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -437,4 +438,56 @@ func TestWatchFirstPageCarriesSniffedMimes(t *testing.T) {
 	assert.Equal(t, "text/plain", page.Entries[0].Mime)
 	assert.Equal(t, "application/x-shellscript", page.Entries[1].Mime)
 	assert.Equal(t, "application-x-shellscript", page.Entries[1].IconName)
+}
+
+func TestWatchAnswersAHugeBurstWithOneResync(t *testing.T) {
+	bus := &fakeBus{}
+	svc := NewService(bus, t.TempDir(), nil)
+	t.Cleanup(svc.Close)
+	svc.newNotifier = func() (notifier, error) { return newFakeNotifier(), nil }
+
+	root := t.TempDir()
+	w, err := svc.Watch(context.Background(), root, nameSort(), false)
+	require.NoError(t, err)
+	svc.Attach([]string{w.topic})
+
+	names := make([]string, 0, burstLimit+1)
+	for i := range burstLimit + 1 {
+		names = append(names, "burst"+strconv.Itoa(i)+".txt")
+		require.NoError(t, os.WriteFile(filepath.Join(root, names[i]), nil, 0o644))
+	}
+	w.flush(names)
+
+	events := bus.snapshot()
+	require.Len(t, events, 1)
+	assert.Equal(t, "resync", events[0].Kind)
+	assert.Empty(t, events[0].Added)
+	assert.Len(t, viewNames(w, ListOptions{Sort: nameSort(), Limit: burstLimit * 2}), burstLimit+1)
+}
+
+func TestWatchKeepsChangesBeyondThePagedWindowToItself(t *testing.T) {
+	bus := &fakeBus{}
+	svc := NewService(bus, t.TempDir(), nil)
+	t.Cleanup(svc.Close)
+	svc.newNotifier = func() (notifier, error) { return newFakeNotifier(), nil }
+
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		require.NoError(t, os.WriteFile(filepath.Join(root, name), nil, 0o644))
+	}
+	w, err := svc.Watch(context.Background(), root, nameSort(), false)
+	require.NoError(t, err)
+	svc.Attach([]string{w.topic})
+	w.page(ListOptions{Sort: nameSort(), Limit: 1})
+
+	first, _ := w.entry("a.txt")
+	last, _ := w.entry("c.txt")
+	first.Mime, last.Mime = "text/x-first", "text/x-last"
+	w.applyChanged([]Entry{first, last}, "batch")
+
+	changed := bus.await(t, func(b batch) bool { return len(b.Changed) > 0 })
+	require.Len(t, changed.Changed, 1)
+	assert.Equal(t, "a.txt", changed.Changed[0].Name)
+	kept, _ := w.entry("c.txt")
+	assert.Equal(t, "text/x-last", kept.Mime)
 }
