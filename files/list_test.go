@@ -140,6 +140,30 @@ func TestListUnreadableChild(t *testing.T) {
 	assert.Equal(t, CodeAccess, CodeOf(err))
 }
 
+func TestListKeepsEntriesItCannotStat(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permission bits")
+	}
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.sock"), nil, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".b"), nil, 0o644))
+	require.NoError(t, os.Chmod(root, 0o444))
+	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
+
+	entries, err := List(root, ListOptions{IncludeHidden: true, Sort: nameSort()})
+	require.NoError(t, err)
+	assert.Equal(t, []string{".b", "a.sock"}, namesOf(entries))
+
+	sock := byName(t, entries, "a.sock")
+	assert.True(t, sock.Unreadable)
+	assert.Equal(t, filepath.Join(root, "a.sock"), sock.Path)
+	assert.Equal(t, int64(-1), sock.Size)
+	assert.True(t, byName(t, entries, ".b").Hidden)
+
+	assert.Equal(t, Count{Count: 1}, countChildren(root, false))
+	assert.Equal(t, Count{Count: 2}, countChildren(root, true))
+}
+
 func TestListLargeDirectory(t *testing.T) {
 	root := t.TempDir()
 	for i := range 3000 {

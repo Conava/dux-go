@@ -55,9 +55,9 @@ func countChildren(path string, includeHidden bool) Count {
 
 	total := 0
 	for total <= CountCap {
-		batch, err := f.ReadDir(256)
-		for _, de := range batch {
-			if !includeHidden && strings.HasPrefix(de.Name(), ".") {
+		names, err := f.Readdirnames(256)
+		for _, name := range names {
+			if !includeHidden && strings.HasPrefix(name, ".") {
 				continue
 			}
 			total++

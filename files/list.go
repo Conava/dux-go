@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -73,7 +74,7 @@ func (b *builder) readDir(dir string) ([]Entry, error) {
 	if !filepath.IsAbs(dir) {
 		return nil, &Error{Code: CodeInvalid, Path: dir, Err: errors.New("path must be absolute")}
 	}
-	names, err := os.ReadDir(dir)
+	names, err := dirNames(dir)
 	if err != nil {
 		return nil, Wrap(dir, err)
 	}
@@ -81,18 +82,34 @@ func (b *builder) readDir(dir string) ([]Entry, error) {
 	b.icons.reloadChangedUserDirs()
 	hidden := hiddenNames(dir)
 	entries := make([]Entry, 0, len(names))
-	for _, de := range names {
-		e, err := b.entry(dir, de.Name(), hidden[de.Name()])
+	for _, name := range names {
+		e, err := b.entry(dir, name, hidden[name])
 		switch {
 		case errors.Is(err, fs.ErrNotExist):
 			continue
 		case err != nil:
-			entries = append(entries, b.unreadable(dir, de.Name(), hidden[de.Name()]))
+			entries = append(entries, b.unreadable(dir, name, hidden[name]))
 			continue
 		}
 		entries = append(entries, e)
 	}
 	return entries, nil
+}
+
+// os.ReadDir stats entries of unknown type and fails the whole read on the first error.
+func dirNames(dir string) ([]string, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 func List(dir string, opts ListOptions) ([]Entry, error) {
